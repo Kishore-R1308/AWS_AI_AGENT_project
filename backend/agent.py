@@ -1,8 +1,7 @@
 import json
 from typing import TypedDict
-
 from langchain_groq import ChatGroq
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import START, END, StateGraph
 
 from aws_tools import (
     get_ec2_instances,
@@ -10,592 +9,352 @@ from aws_tools import (
     get_s3_buckets,
     get_s3_storage_summary,
     get_vpcs,
-    get_vpc_subnets,
-    get_vpc_route_tables,
-    get_vpc_internet_gateways,
-    get_vpc_security_groups,
+    get_subnets,
+    get_internet_gateways,
+    get_route_tables,
+    get_security_groups,
+    get_cost_by_service,
+    get_cost_summary,
+    get_patch_status,
+    get_lambda_functions
 )
-
+from schemas import Plan
 from config import GROQ_API_KEY, GROQ_MODEL
 from rag import retrieve_context
 
+
+# =====================================================
+# TOOL MAP
+# =====================================================
+
+TOOL_MAP = {
+    "get_ec2_instances": get_ec2_instances,
+    "get_s3_buckets": get_s3_buckets,
+    "get_s3_storage_summary": get_s3_storage_summary,
+    "get_rds_instances": get_rds_instances,
+    "get_vpcs": get_vpcs,
+    "get_subnets": get_subnets,
+    "get_internet_gateways": get_internet_gateways,
+    "get_route_tables": get_route_tables,
+    "get_security_groups": get_security_groups,
+    "get_cost_summary": get_cost_summary,
+    "get_cost_by_service": get_cost_by_service,
+    "get_patch_status": get_patch_status,
+    "get_lambda_functions": get_lambda_functions
+    
+}
+
+
+# =====================================================
+# STATE
+# =====================================================
 
 class AgentState(TypedDict, total=False):
     session_id: str
     query: str
     intent: str
-    service: str
+    tools: list[str]
     context: str
+    service: str
     tool_result: str
     answer: str
 
 
+# =====================================================
+# LLM
+# =====================================================
+
 llm = ChatGroq(
     model=GROQ_MODEL,
     temperature=0,
-    api_key=GROQ_API_KEY,
+    api_key=GROQ_API_KEY
 )
 
+planner_llm = llm.with_structured_output(Plan)
 
-# ============================================================
-# INTENT CLASSIFICATION
-# ============================================================
 
-def classify_intent(state):
+# =====================================================
+# PLANNER NODE
+# =====================================================
+
+def planner_node(state):
     prompt = f"""
-You are an AWS chatbot intent classifier.
+You are an AWS AI planner.
 
-Classify the query as exactly one of:
+Your responsibilities:
 
-KNOWLEDGE
-MONITORING
+1. Determine the user's intent.
+2. Decide whether AWS account data is required.
+3. Select ALL required tools.
 
-KNOWLEDGE means:
-- AWS concepts
-- How-to questions
-- Documentation
-- Configuration
-- Architecture
-- General explanations
+Available Tools:
 
-MONITORING means:
-- Current information from the connected AWS account
-- Current EC2/S3/RDS/VPC resources
-- Current resource states
-- Current storage or database information
-- Current networking information
+get_ec2_instances
+get_s3_buckets
+get_s3_storage_summary
+get_rds_instances
+get_vpcs
+get_subnets
+get_internet_gateways
+get_route_tables
+get_security_groups
+get_cost_summary
+get_cost_by_service
+get_patch_status
+get_lambda_functions
+
+Intent Definitions:
+
+KNOWLEDGE:
+AWS concepts
+Explanations
+Documentation
+Architecture
+Configuration
+How-to questions
+Best practices
+
+MONITORING:
+Questions requiring live AWS account data
+Inventory
+Counts
+Resource status
+Storage usage
+Existing resources
+
+Rules:
+
+Detect ALL services mentioned or implied.
+A question may require multiple tools.
+Never omit a required tool.
+Use get_s3_storage_summary only when storage usage,
+  bucket sizing, or storage comparison is required.
+Return JSON only.
 
 Examples:
 
-"How do I create an EC2 instance?"
-=> KNOWLEDGE
+User:
+What is EC2?
 
-"What is an S3 bucket?"
-=> KNOWLEDGE
+Response:
+{{
+    "intent": "KNOWLEDGE",
+    "tools": []
+}}
 
-"Which EC2 instances are running?"
-=> MONITORING
+User:
+How many EC2 instances do I have?
 
-"Which S3 bucket has the highest storage?"
-=> MONITORING
+Response:
+{{
+    "intent": "MONITORING",
+    "tools": [
+        "get_ec2_instances"
+    ]
+}}
 
-"How many VPCs do I have?"
-=> MONITORING
+User:
+List EC2 and S3 resources.
 
-"Show my VPCs"
-=> MONITORING
+Response:
+{{
+    "intent": "MONITORING",
+    "tools": [
+        "get_ec2_instances",
+        "get_s3_buckets"
+    ]
+}}
 
-"Show my subnets"
-=> MONITORING
+User:
+Show EC2, S3 and RDS inventory.
 
-"Which VPCs do I have?"
-=> MONITORING
+Response:
+{{
+    "intent": "MONITORING",
+    "tools": [
+        "get_ec2_instances",
+        "get_s3_buckets",
+        "get_rds_instances"
+    ]
+}}
 
-Return ONLY JSON.
+User:
+Which S3 bucket consumes the most storage?
 
-Example:
-{{"intent":"KNOWLEDGE"}}
+Response:
+{{
+    "intent": "MONITORING",
+    "tools": [
+        "get_s3_storage_summary"
+    ]
+}}
 
-User query:
+User Query:
 {state["query"]}
+Return only the structured output.
 """
-
-    content = llm.invoke(prompt).content.strip()
-
     try:
-        result = json.loads(content)
-
-        intent = result.get(
-            "intent",
-            "KNOWLEDGE"
-        ).upper()
-
-    except Exception:
-        intent = (
-            "MONITORING"
-            if "MONITOR" in content.upper()
-            else "KNOWLEDGE"
-        )
-
-    if intent not in {
-        "KNOWLEDGE",
-        "MONITORING",
-    }:
-        intent = "KNOWLEDGE"
-
-    return {
-        "intent": intent
-    }
-
-
-# ============================================================
-# SERVICE DETECTION
-# ============================================================
-
-def detect_service(state):
-    if state["intent"] == "KNOWLEDGE":
+        response=llm.invoke(prompt)
+        content=response.content
+        result=json.loads(content)
+        intent=result.get("intent", "KNOWLEDGE").upper()
+        tools=result.get("tools", [])
+        valid_tools=[tool for tool in tools if tool in TOOL_MAP]
         return {
-            "service": ""
+            "intent": intent,
+            "tools": valid_tools
         }
-
-    prompt = f"""
-Identify the AWS service involved in this monitoring query.
-
-Allowed services:
-
-EC2
-S3
-RDS
-VPC
-
-Important:
-
-VPC questions include:
-- VPC
-- VPCs
-- subnet
-- subnets
-- CIDR
-- route table
-- route tables
-- internet gateway
-- NAT gateway
-- security group
-- security groups
-- networking
-
-Examples:
-
-"Which EC2 instances are running?"
-=> {{"service":"EC2"}}
-
-"Show my S3 buckets"
-=> {{"service":"S3"}}
-
-"Which RDS databases are available?"
-=> {{"service":"RDS"}}
-
-"How many VPCs do I have?"
-=> {{"service":"VPC"}}
-
-"Show my VPCs"
-=> {{"service":"VPC"}}
-
-"Show my subnets"
-=> {{"service":"VPC"}}
-
-"Which VPC has CIDR 10.0.0.0/16?"
-=> {{"service":"VPC"}}
-
-"Show my route tables"
-=> {{"service":"VPC"}}
-
-"Show my security groups"
-=> {{"service":"VPC"}}
-
-Return ONLY JSON.
-
-Query:
-{state["query"]}
-"""
-
-    content = llm.invoke(prompt).content.strip()
-
-    try:
-        result = json.loads(content)
-
-        service = result.get(
-            "service",
-            "EC2"
-        ).upper()
-
-    except Exception:
-
-        query = state["query"].upper()
-
-        # VPC must be checked FIRST
-        # because networking questions
-        # can sometimes contain EC2/S3 terms.
-
-        if (
-            "VPC" in query
-            or "SUBNET" in query
-            or "CIDR" in query
-            or "ROUTE TABLE" in query
-            or "INTERNET GATEWAY" in query
-            or "NAT GATEWAY" in query
-            or "SECURITY GROUP" in query
-            or "NETWORKING" in query
-        ):
-            service = "VPC"
-
-        elif (
-            "S3" in query
-            or "BUCKET" in query
-            or "STORAGE" in query
-        ):
-            service = "S3"
-
-        elif (
-            "RDS" in query
-            or "DATABASE" in query
-        ):
-            service = "RDS"
-
-        else:
-            service = "EC2"
-
-    if service not in {
-        "EC2",
-        "S3",
-        "RDS",
-        "VPC",
-    }:
-        service = "EC2"
-
-    return {
-        "service": service
+    except Exception as e:
+        print("Planner Error:", str(e))
+        return {
+        "intent": "KNOWLEDGE",
+        "tools": []
     }
+    
 
 
-# ============================================================
-# KNOWLEDGE
-# ============================================================
+# =====================================================
+# KNOWLEDGE NODE
+# =====================================================
 
 def knowledge_node(state):
-    context = retrieve_context(
-        state["query"]
-    )
-
-    return {
-        "context": context
-    }
+    context = retrieve_context(state["query"])
+    return {"context": context}
 
 
-# ============================================================
-# MONITORING
-# ============================================================
+# =====================================================
+# MONITORING NODE
+# =====================================================
 
 def monitoring_node(state):
     session_id = state["session_id"]
+    tools = state.get("tools", [])
 
-    service = state.get(
-        "service",
-        "EC2"
-    )
+    print("\nSelected Tools:", tools)
+    results = {}
 
-    query = state["query"].lower()
+    for tool_name in tools:
+        try:
+            print(f"Executing {tool_name}")
+            tool_function = TOOL_MAP[tool_name]
+            results[tool_name] = tool_function(session_id)
+        except Exception as e:
+            print(f"Error executing {tool_name}: {str(e)}")
+            results[tool_name] = {"error": str(e)}
 
-    # --------------------------------------------------------
-    # EC2
-    # --------------------------------------------------------
-
-    if service == "EC2":
-
-        result = get_ec2_instances(
-            session_id
-        )
-
-    # --------------------------------------------------------
-    # S3
-    # --------------------------------------------------------
-
-    elif service == "S3":
-
-        storage_words = [
-            "storage",
-            "size",
-            "largest",
-            "highest",
-        ]
-
-        if any(
-            word in query
-            for word in storage_words
-        ):
-            result = get_s3_storage_summary(
-                session_id
-            )
-
-        else:
-            result = get_s3_buckets(
-                session_id
-            )
-
-    # --------------------------------------------------------
-    # RDS
-    # --------------------------------------------------------
-
-    elif service == "RDS":
-
-        result = get_rds_instances(
-            session_id
-        )
-
-    # --------------------------------------------------------
-    # VPC
-    # --------------------------------------------------------
-
-    elif service == "VPC":
-
-        # VPC list
-        if (
-            "vpc" in query
-            and (
-                "how many" in query
-                or "count" in query
-                or "list" in query
-                or "show" in query
-                or "which" in query
-            )
-        ):
-            result = get_vpcs(
-                session_id
-            )
-
-        # Subnets
-        elif "subnet" in query:
-
-            result = get_vpc_subnets(
-                session_id
-            )
-
-        # Route tables
-        elif (
-            "route table" in query
-            or "route tables" in query
-        ):
-
-            result = get_vpc_route_tables(
-                session_id
-            )
-
-        # Internet gateways
-        elif (
-            "internet gateway" in query
-            or "internet gateways" in query
-        ):
-
-            result = get_vpc_internet_gateways(
-                session_id
-            )
-
-        # Security groups
-        elif (
-            "security group" in query
-            or "security groups" in query
-        ):
-
-            result = get_vpc_security_groups(
-                session_id
-            )
-
-        # Default VPC operation
-        else:
-
-            result = get_vpcs(
-                session_id
-            )
-
-    # --------------------------------------------------------
-    # Unsupported service
-    # --------------------------------------------------------
-
-    else:
-
-        result = {
-            "error": (
-                f"Unsupported AWS service: "
-                f"{service}"
-            )
-        }
 
     return {
-        "tool_result": json.dumps(
-            result,
-            indent=2,
-            default=str,
-        )
+        "tool_result": json.dumps(results, indent=2, default=str)
     }
 
 
-# ============================================================
-# FINAL ANSWER
-# ============================================================
+# =====================================================
+# FINAL ANSWER NODE
+# =====================================================
 
 def final_answer_node(state):
-
     if state["intent"] == "KNOWLEDGE":
-
         prompt = f"""
 You are an AWS technical assistant.
-
-Answer the question using ONLY the supplied AWS knowledge.
-
-Do not invent facts.
+Answer only using the applied AWS knowledge.
+Do not hallucinate.
+Do not invent AWS details.
 
 Question:
 {state["query"]}
 
-AWS knowledge:
+Knowledge Base:
 {state.get("context", "")}
 
-Give a clear and practical answer.
+Rules:
+- Answer only from the supplied knowledge.
+- Do not invent information.
+- Provide a practical explanation.
 """
-
     else:
 
         prompt = f"""
 You are an AWS monitoring assistant.
 
-The application queried the connected AWS account using boto3.
-
-AWS service:
-{state.get("service")}
-
-User question:
+User Question:
 {state["query"]}
 
-Actual AWS result:
-{state.get("tool_result", "")}
+Tools Executed:
+{state.get("tools")}
 
-Explain the result clearly.
+AWS Results:
+{state.get("tool_result")}
 
-Important rules:
+Rules:
+1. Use only AWS Results.
+2. Never invent resources.
+3. Never invent counts.
+4. Never invent names.
+5. If multiple services were returned, summarize each service.
+6. Provide totals whenever possible.
+7. If no resources exist, explicitly state that.
+8. If errors are present, summarize them clearly.
+9. Create a consolidated report.
+10. Format the answer as a clean report:
+        -Use heading for each service
+        -Show counts and tables
+        -List details in bullet points
+        -End with total summary
+        -Use tables for listing resources and its details
 
-1. Use ONLY the actual AWS result.
-2. Do not invent resources or values.
-3. If the result is a list of VPCs, calculate the number
-   of VPCs from the list.
-4. If there are zero VPCs, clearly say that no VPCs
-   were returned.
-5. For VPC questions, mention relevant VPC IDs,
-   CIDR blocks, state, and default status when available.
+
+Generate the final answer in a clear and concise manner.
 """
 
-    answer = llm.invoke(
-        prompt
-    ).content
-
-    return {
-        "answer": answer
-    }
+    response = llm.invoke(prompt)
+    return {"answer": response.content}
 
 
-# ============================================================
-# ROUTING
-# ============================================================
+# =====================================================
+# ROUTER
+# =====================================================
 
-def route_after_intent(state):
-
+def route_after_planner(state):
     if state["intent"] == "KNOWLEDGE":
         return "knowledge"
-
-    return "service"
-
-
-# ============================================================
-# LANGGRAPH
-# ============================================================
-
-builder = StateGraph(
-    AgentState
-)
+    return "monitoring"
 
 
-builder.add_node(
-    "classify_intent",
-    classify_intent,
-)
+# =====================================================
+# GRAPH
+# =====================================================
 
+builder = StateGraph(AgentState)
 
-builder.add_node(
-    "service",
-    detect_service,
-)
+builder.add_node("planner", planner_node)
+builder.add_node("knowledge", knowledge_node)
+builder.add_node("monitoring", monitoring_node)
+builder.add_node("final", final_answer_node)
 
-
-builder.add_node(
-    "knowledge",
-    knowledge_node,
-)
-
-
-builder.add_node(
-    "monitoring",
-    monitoring_node,
-)
-
-
-builder.add_node(
-    "final",
-    final_answer_node,
-)
-
-
-builder.add_edge(
-    START,
-    "classify_intent",
-)
-
-
-builder.add_conditional_edges(
-    "classify_intent",
-    route_after_intent,
-    {
-        "knowledge": "knowledge",
-        "service": "service",
-    },
-)
-
-
-builder.add_edge(
-    "knowledge",
-    "final",
-)
-
-
-builder.add_edge(
-    "service",
-    "monitoring",
-)
-
-
-builder.add_edge(
-    "monitoring",
-    "final",
-)
-
-
-builder.add_edge(
-    "final",
-    END,
-)
-
+builder.add_edge(START, "planner")
+builder.add_conditional_edges("planner", route_after_planner, {
+    "knowledge": "knowledge",
+    "monitoring": "monitoring",
+})
+builder.add_edge("knowledge", "final")
+builder.add_edge("monitoring", "final")
+builder.add_edge("final", END)
 
 graph = builder.compile()
 
 
-# ============================================================
+# =====================================================
 # RUN AGENT
-# ============================================================
+# =====================================================
 
-def run_agent(
-    session_id,
-    query
-):
-
-    result = graph.invoke(
-        {
-            "session_id": session_id,
-            "query": query,
-        }
-    )
+def run_agent(session_id, query):
+    result = graph.invoke({
+        "session_id": session_id,
+        "query": query,
+    })
 
     return {
         "answer": result["answer"],
         "intent": result["intent"],
-        "service": result.get(
-            "service"
-        ) or None,
+        "tools": result.get("tools", []),
     }

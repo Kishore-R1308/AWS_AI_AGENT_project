@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from agent import run_agent
-from aws_auth import connect_aws
+from aws_auth import AWS_SESSIONS, connect_aws
 from database import Base, engine, get_db
 from models import ChatMessage
 from schemas import (
@@ -20,7 +20,6 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title="AWS AI Agent",
     version="1.0.0",
-    description="RAG + LangGraph + Boto3 AWS Monitoring Agent",
 )
 
 app.add_middleware(
@@ -87,7 +86,22 @@ def chat(
             detail=str(exc),
         )
 
+    aws_sessions=AWS_SESSIONS.get(request.session_id)
+    if not aws_sessions:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid session_id. Please connect to AWS first.",
+        )
+
+    account_id=aws_sessions.get("account_id")
+    if not account_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Account ID not found for the given session_id.",
+        )
+
     record = ChatMessage(
+        account_id=account_id,
         session_id=request.session_id,
         user_message=request.message,
         assistant_message=result["answer"],
@@ -101,15 +115,15 @@ def chat(
     return result
 
 
-@app.get("/history/{session_id}")
+@app.get("/history/{account_id}")
 def history(
-    session_id: str,
+    account_id: str,
     db: Session = Depends(get_db),
 ):
     records = (
         db.query(ChatMessage)
         .filter(
-            ChatMessage.session_id == session_id
+            ChatMessage.account_id == account_id
         )
         .order_by(
             ChatMessage.created_at.asc()

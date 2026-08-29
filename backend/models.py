@@ -9,6 +9,7 @@ class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
     id = Column(Integer, primary_key=True, index=True)
+    account_id= Column(String(50), index=True, nullable=False)
     session_id = Column(String(100), index=True, nullable=False)
     user_message = Column(Text, nullable=False)
     assistant_message = Column(Text, nullable=False)

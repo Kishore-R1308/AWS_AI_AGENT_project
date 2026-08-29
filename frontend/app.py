@@ -28,7 +28,7 @@ def load_history():
     try:
         response = requests.get(
             f"{BACKEND_URL}/history/"
-            f"{st.session_state.session_id}",
+            f"{st.session_state.account_id}",
             timeout=10,
         )
 
@@ -40,12 +40,30 @@ def load_history():
 
     return []
 
+def load_history_for_account(account_id):
+    try:
+        response=requests.get(f"{BACKEND_URL}/history/{account_id}",
+        timeout=10)
+
+        if response.status_code==200:
+            history=response.json()
+            st.session_state.messages=[]
+            for item in history:
+                st.session_state.messages.append({
+                    "user":item["user_message"],
+                    "assistant":item["assistant_message"],
+                    "intent":item["intent"],
+                    "service":item["service"]
+                })
+
+            return True
+    except Exception as exc:
+        st.error(f"Could not load chat history: {exec}")
+    return False
 
 st.title("☁️ AWS AI Agent")
 
-st.caption(
-    "RAG + LangGraph + Boto3 + Groq"
-)
+
 
 
 with st.sidebar:
@@ -127,6 +145,10 @@ with st.sidebar:
 
                         st.session_state.messages = []
 
+                        load_history_for_account(
+                            st.session_state.account_id
+                        )
+
                         st.success(
                             "AWS Connected Successfully"
                         )
@@ -175,42 +197,6 @@ with st.sidebar:
 
     st.divider()
 
-    st.subheader("Example queries")
-
-    st.markdown(
-        """
-**Knowledge**
-
-- How do I create an EC2 instance?
-- What is an S3 bucket?
-- How does RDS Multi-AZ work?
-- How do IAM roles work?
-
-**Monitoring**
-
-- Which EC2 instances are running?
-- Show my S3 buckets.
-- Which S3 bucket has the highest storage?
-- Show my RDS databases.
-"""
-    )
-
-
-if (
-    not st.session_state.messages
-    and st.session_state.aws_connected
-):
-    history = load_history()
-
-    for item in history:
-        st.session_state.messages.append(
-            {
-                "user": item["user_message"],
-                "assistant": item["assistant_message"],
-                "intent": item["intent"],
-                "service": item["service"],
-            }
-        )
 
 
 st.subheader("💬 Chat")
@@ -227,7 +213,10 @@ for message in st.session_state.messages:
             f"Intent: {message['intent']}"
         ]
 
-        if message.get("service"):
+        if (
+            message["intent"] == "MONITORING"
+            and message.get("service")
+        ):
             metadata.append(
                 f"Service: {message['service']}"
             )
@@ -290,7 +279,10 @@ if prompt:
                     f"Intent: {data['intent']}"
                 )
 
-                if data.get("service"):
+                if (
+                    data["intent"] == "MONITORING"
+                    and data.get("service")
+                ):
                     caption += (
                         f" | Service: "
                         f"{data['service']}"

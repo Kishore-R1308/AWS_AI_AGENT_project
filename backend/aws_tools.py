@@ -1,4 +1,5 @@
 from aws_auth import get_aws_client
+from datetime import date, timedelta
 
 
 def get_ec2_instances(session_id):
@@ -135,7 +136,7 @@ def get_vpcs(session_id):
     return results
 
 
-def get_vpc_subnets(session_id):
+def get_subnets(session_id):
     ec2 = get_aws_client(session_id, "ec2")
     response = ec2.describe_subnets()
 
@@ -166,7 +167,7 @@ def get_vpc_subnets(session_id):
     return results
 
 
-def get_vpc_route_tables(session_id):
+def get_route_tables(session_id):
     ec2 = get_aws_client(session_id, "ec2")
     response = ec2.describe_route_tables()
 
@@ -194,7 +195,7 @@ def get_vpc_route_tables(session_id):
     return results
 
 
-def get_vpc_internet_gateways(session_id):
+def get_internet_gateways(session_id):
     ec2 = get_aws_client(session_id, "ec2")
     response = ec2.describe_internet_gateways()
 
@@ -229,7 +230,7 @@ def get_vpc_internet_gateways(session_id):
     return results
 
 
-def get_vpc_security_groups(session_id):
+def get_security_groups(session_id):
     ec2 = get_aws_client(session_id, "ec2")
     response = ec2.describe_security_groups()
 
@@ -252,3 +253,86 @@ def get_vpc_security_groups(session_id):
         )
 
     return results
+
+
+
+
+def get_cost_summary(session_id):
+    ce = get_aws_client(session_id, "ce")
+
+    end_date = date.today()
+    start_date = end_date - timedelta(days=30)
+
+    response = ce.get_cost_and_usage(
+        TimePeriod={
+            "Start": start_date.strftime("%Y-%m-%d"),
+            "End": end_date.strftime("%Y-%m-%d"),
+        },
+        Granularity="MONTHLY",
+        Metrics=["UnblendedCost"],
+    )
+
+    return response.get("ResultsByTime", [])
+
+
+def get_cost_by_service(session_id):
+    ce = get_aws_client(session_id, "ce")
+
+    end_date = date.today()
+    start_date = end_date - timedelta(days=30)
+
+    response = ce.get_cost_and_usage(
+        TimePeriod={
+            "Start": start_date.strftime("%Y-%m-%d"),
+            "End": end_date.strftime("%Y-%m-%d"),
+        },
+        Granularity="MONTHLY",
+        Metrics=["UnblendedCost"],
+        GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+    )
+
+    return response.get("ResultsByTime", [])
+
+
+def get_patch_status(session_id):
+    ssm = get_aws_client(session_id, "ssm")
+
+    managed_instances = ssm.describe_instance_information()
+    instance_ids = [i["InstanceId"] for i in managed_instances["InstanceInformationList"]]
+
+    response = ssm.describe_instance_patch_states(InstanceIds=instance_ids)
+
+    return [
+        {
+            "instance_id": instance.get("InstanceId"),
+            "missing_count": instance.get("MissingCount"),
+            "installed_count": instance.get("InstalledCount"),
+            "failed_count": instance.get("FailedCount"),
+            "operation_end_time": str(instance.get("OperationEndTime")),
+        }
+        for instance in response.get("InstancePatchStates", [])
+    ]
+
+import boto3
+
+def get_lambda_functions(session_id):
+    lambda_client = get_aws_client(session_id, "lambda")
+
+    try:
+        paginator = lambda_client.get_paginator("list_functions")
+        functions = []
+
+        for page in paginator.paginate():
+            for fn in page.get("Functions", []):
+                functions.append({
+                    "function_name": fn.get("FunctionName"),
+                    "runtime": fn.get("Runtime"),
+                    "last_modified": fn.get("LastModified"),
+                    "arn": fn.get("FunctionArn"),
+                })
+
+        return functions
+
+    except Exception as e:
+        return {"error": f"Failed to list Lambda functions: {str(e)}"}
+

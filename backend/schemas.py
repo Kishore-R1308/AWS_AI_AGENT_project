@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel
 
@@ -28,3 +28,7 @@ class ChatResponse(BaseModel):
     answer: str
     intent: str
     service: Optional[str] = None
+
+class Plan(BaseModel):
+    intent: str
+    tools: List[str]

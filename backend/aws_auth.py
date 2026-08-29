@@ -47,6 +47,9 @@ def connect_aws(
     )
 
     identity = assumed_sts.get_caller_identity()
+    account_id=identity["Account"]
+    arn=identity["Arn"]
+    AWS_SESSIONS[session_id]["account_id"] = account_id
 
     return {
         "connected": True,
