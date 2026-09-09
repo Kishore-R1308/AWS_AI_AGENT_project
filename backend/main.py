@@ -107,6 +107,8 @@ def chat(
         assistant_message=result["answer"],
         intent=result["intent"],
         service=result.get("service"),
+        rca=result.get("rca"),
+        recommendations=result.get("recommendations")
     )
 
     db.add(record)
@@ -138,6 +140,8 @@ def history(
             "assistant_message": record.assistant_message,
             "intent": record.intent,
             "service": record.service,
+            "rca": record.rca,
+            "recommendations": record.recommendations,
             "created_at": str(record.created_at),
         }
         for record in records

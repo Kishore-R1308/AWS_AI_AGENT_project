@@ -15,4 +15,6 @@ class ChatMessage(Base):
     assistant_message = Column(Text, nullable=False)
     intent = Column(String(50), nullable=False)
     service = Column(String(50), nullable=True)
+    rca = Column(Text, nullable=True)
+    recommendations = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
