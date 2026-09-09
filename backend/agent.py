@@ -2,6 +2,7 @@ import json
 from typing import TypedDict
 
 from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from langgraph.graph import START, END, StateGraph
 
 from aws_tools import (
@@ -24,10 +25,12 @@ from aws_tools import (
     get_resource_tags,
     get_ec2_tags,
     get_s3_tags,
-    get_lambda_tags
+    get_lambda_tags,
+    get_cloudwatch_alarms,
+    get_cloudwatch_logs
 )
 
-from config import GROQ_API_KEY, GROQ_MODEL
+from config import OPENROUTER_API_KEY, OPENROUTER_MODEL
 from rag import retrieve_context
 
 
@@ -55,7 +58,9 @@ TOOL_MAP = {
     "get_resource_tags": get_resource_tags,
     "get_ec2_tags": get_ec2_tags,
     "get_s3_tags": get_s3_tags,
-    "get_lambda_tags": get_lambda_tags
+    "get_lambda_tags": get_lambda_tags,
+    "get_cloudwatch_alarms": get_cloudwatch_alarms,
+    "get_cloudwatch_logs": get_cloudwatch_logs
 }
 
 
@@ -80,45 +85,55 @@ class AgentState(TypedDict, total=False):
 # LLM
 # =====================================================
 
-llm = ChatGroq(
-    model=GROQ_MODEL,
+llm = ChatOpenAI(
+    model=OPENROUTER_MODEL,
     temperature=0,
-    api_key=GROQ_API_KEY
+    api_key=OPENROUTER_API_KEY,
+    base_url="https://openrouter.ai/api/v1"
 )
 
-# IMPORTANT:
-# Do NOT use with_structured_output here because your
-# current Groq configuration is returning:
-# "Tool choice is required, but model did not call a tool"
 planner_llm = llm
 
-
-# =====================================================
-# PLANNER NODE
-# =====================================================
 
 def planner_node(state):
 
     prompt = f"""
 You are an AWS planning agent.
 
-Return ONLY a valid JSON object with the following keys:
-
-{{
-    "intent": "<KNOWLEDGE|MONITORING|ROOT CAUSE ANALYSIS>",
-    "tools": ["tool1", "tool2"],
-    "services": ["service1", "service2"]
-}}
 
 Your responsibilities:
 
-1. Determine whether the query is KNOWLEDGE, MONITORING, or ROOT CAUSE ANALYSIS (RCA).
-2. Decide whether AWS account data is required.
-3. Select ALL AWS required tools.
-4. Select ALL AWS services involved.
-5. A query can require multiple tools.
-6. Follow up questions may rely on previous context.
+1. Determine whether the query is AWS related.
+2. Block non-AWS queries.
+3. Block requests for credentials, passwords, secrets, tokens or keys but allow logs of cloudwatch and cloudtrail.
+4. For valid AWS queries, determine the intent:
+-KNOWLEDGE
+-MONITORING
+-RCA
+5. Allow educational security questions.
 
+Return only a JSON object.
+
+Return ONLY a valid JSON object with the following keys:
+
+For allowed AWS queries, return:
+{{
+    "allowed": true,
+    "reason": "",
+    "intent": "KNOWLEDGE"",
+    "tools": [],
+    "services": []
+}}
+
+For blocked queries, return:
+{{
+    "allowed": false,
+    "reason": "Clear explanation of why the request was blocked.",
+    "intent": "BLOCKED",
+    "tools": [],
+    "services": []
+
+}}
 
 Available Tools:
 
@@ -142,7 +157,8 @@ get_resource_tags
 get_ec2_tags
 get_s3_tags
 get_lambda_tags
-
+get_cloudwatch_alarms
+get_cloudwatch_logs
 
 Intent Definitions:
 
@@ -153,31 +169,14 @@ Explanations
 Documentation
 Architecture
 Configuration
-How-to questions
 Best practices
 General AWS Learning
-
-A KNOWLEDGE query asks about AWS in general and does not require
-investigating the user's actual AWS environment.
 
 
 MONITORING:
 
 Questions requiring data from the user's AWS account.
-
-Resource Inventory
-Resource Counts
-Resource status
-Storage usage
-Existing AWS resources
-Storage information
-Cost information
-Patch compliance information
-Networking information
-
-A MONITORING query retrieves or summarizes the current state
-of resources in the user's AWS account.
-
+Resource Inventory, counts, status, usage, cost.
 
 ROOT CAUSE ANALYSIS:
 
@@ -186,31 +185,10 @@ Incident investigation
 Failure diagnosis
 Performance degradation analysis
 Security finding analysis
-CloudTrail event analysis
-CloudWatch anomaly investigation
-Questions asking "why"
 Questions asking for causes, impact, failures or anomalies
-Queries investigating unexpected behavior
-Queries investigating service disruptions
-Queries investigating operational issues
 Troubleshooting
 Diagnosis of AWS problems
 
-IMPORTANT RCA RULE:
-
-If the user is investigating a problem, failure, incident, anomaly,
-performance issue, security issue, unexpected behavior, degradation,
-or asks WHY something is happening, classify the query as
-ROOT CAUSE ANALYSIS.
-
-If the query asks to find the cause of a problem in the user's
-AWS environment, classify it as ROOT CAUSE ANALYSIS.
-
-Do NOT classify an AWS troubleshooting or investigation query
-as KNOWLEDGE simply because it asks for an explanation.
-
-For RCA queries, select the AWS tools required to investigate
-the actual problem.
 
 For example:
 
@@ -235,358 +213,86 @@ must be:
 Rules:
 
 - Detect every AWS service mentioned.
-- A query can require multiple tools.
 - Never omit a required tool.
-- Never return invalid tool names.
 - Return only the JSON response.
-- Always populate services.
-- For KNOWLEDGE queries, tools should be empty.
-- For KNOWLEDGE queries, services should still contain the AWS services discussed if applicable.
-- For MONITORING queries, select all tools required to retrieve the requested AWS account data.
-- RCA queries focus on identifying causes, impact, failures, incidents, anomalies, or unexpected behavior.
-- RCA queries may require multiple tools.
 - Select all relevant tools needed for investigation.
-- Consider all AWS services mentioned in the query.
 - Include supporting AWS services if they are relevant to the investigation.
-- Never assume a single tool is sufficient.
-- For RCA, services should include both the affected service and related investigation services.
-- Environment-wide RCA queries may require multiple tools.
-- If an RCA query involves performance or anomalies, consider CloudWatch and CloudTrail.
-- If an RCA query involves security findings, consider Inspector and CloudTrail.
-- If an RCA query concerns the overall AWS environment, consider CloudWatch, CloudTrail, and Inspector.
 - Do not add explanations outside the JSON object.
 
 
 Examples:
-
-User:
-What is EC2?
-
-Intent:
-KNOWLEDGE
-
-Tools:
-[]
-
-Services:
-["EC2"]
-
---------------------------------
-
-User:
-Explain VPC peering.
-
-Intent:
-KNOWLEDGE
-
-Tools:
-[]
-
-Services:
-["VPC"]
-
---------------------------------
-
-User:
-How many EC2 instances do I have?
-
-Intent:
-MONITORING
-
-Tools:
-["get_ec2_instances"]
-
-Services:
-["EC2"]
-
---------------------------------
-
-User:
-Find resources without an Owner tag.
-
-Intent:
-MONITORING
-
-Tools:
-["get_resource_tags"]
-
-Services:
-["Resource Tagging"]
-
---------------------------------
-
-User:
-Why is my EC2 instance experiencing high CPU?
-
-Intent:
-ROOT CAUSE ANALYSIS
-
-Tools:
-[
-    "get_cloudwatch_metrics",
-    "get_cloudtrail_events"
-]
-
-Services:
-[
-    "EC2",
-    "CloudWatch",
-    "CloudTrail"
-]
-
---------------------------------
-
-User:
-How many S3 buckets do I have?
-
-Intent:
-MONITORING
-
-Tools:
-["get_s3_buckets"]
-
-Services:
-["S3"]
-
---------------------------------
-
-User:
-How many EC2 and S3 resources do I have?
-
-Intent:
-MONITORING
-
-Tools:
-[
-    "get_ec2_instances",
-    "get_s3_buckets"
-]
-
-Services:
-[
-    "EC2",
-    "S3"
-]
-
---------------------------------
-
-User:
-Show all EC2 instances along with their tags.
-
-Intent:
-MONITORING
-
-Tools:
-[
-    "get_ec2_instances",
-    "get_ec2_tags"
-]
-
-Services:
-["EC2"]
-
---------------------------------
-
-User:
-Investigate security vulnerabilities in my account.
-
-Intent:
-ROOT CAUSE ANALYSIS
-
-Tools:
-[
-    "get_inspector_findings",
-    "get_cloudtrail_events"
-]
-
-Services:
-[
-    "Inspector",
-    "CloudTrail"
-]
-
---------------------------------
-
-User:
-Show all EC2, S3 and RDS resources.
-
-Intent:
-MONITORING
-
-Tools:
-[
-    "get_ec2_instances",
-    "get_s3_buckets",
-    "get_rds_instances"
-]
-
-Services:
-[
-    "EC2",
-    "S3",
-    "RDS"
-]
-
---------------------------------
-
-User:
-Which S3 bucket consumes the most storage?
-
-Intent:
-MONITORING
-
-Tools:
-[
-    "get_s3_storage_summary"
-]
-
-Services:
-[
-    "S3"
-]
-
---------------------------------
-
-User:
-Show my VPCs.
-
-Intent:
-MONITORING
-
-Tools:
-[
-    "get_vpcs"
-]
-
-Services:
-[
-    "VPC"
-]
-
---------------------------------
-
-User:
-Show all networking resources.
-
-Intent:
-MONITORING
-
-Tools:
-[
-    "get_vpcs",
-    "get_subnets",
-    "get_internet_gateways"
-]
-
-Services:
-[
-    "VPC",
-    "Subnet",
-    "Internet Gateway"
-]
-
---------------------------------
-
-User:
-What is my AWS cost this month?
-
-Intent:
-MONITORING
-
-Tools:
-[
-    "get_cost_summary"
-]
-
-Services:
-[
-    "Cost Explorer"
-]
-
---------------------------------
-
-User:
-Which AWS service costs the most?
-
-Intent:
-MONITORING
-
-Tools:
-[
-    "get_cost_by_service"
-]
-
-Services:
-[
-    "Cost Explorer"
-]
-
---------------------------------
-
-User:
-Show patch compliance status.
-
-Intent:
-MONITORING
-
-Tools:
-[
-    "get_patch_status"
-]
-
-Services:
-[
-    "SSM"
-]
-
---------------------------------
-
-User:
-List all EC2 instances and tell me about their networking.
-
-Intent:
-MONITORING
-
-Tools:
-[
-    "get_ec2_instances",
-    "get_vpcs",
-    "get_subnets",
-    "get_internet_gateways"
-]
-
-Services:
-[
-    "EC2",
-    "VPC",
-    "Subnet",
-    "Internet Gateway"
-]
-
---------------------------------
-
-User:
-Analyze the health of my AWS environment.
-
-Intent:
-ROOT CAUSE ANALYSIS
-
-Tools:
-[
-    "get_cloudwatch_metrics",
-    "get_cloudtrail_events",
-    "get_inspector_findings"
-]
-
-Services:
-[
-    "CloudWatch",
-    "CloudTrail",
-    "Inspector"
-]
-
---------------------------------
-
+ 
+Q: How many EC2 instances do I have?
+ {{
+    "allowed": true,
+    "intent": "MONITORING",
+    "reason":"",
+    "tools": ["get_ec2_instances"],
+    "services": ["EC2"]
+}}
+ 
+Q: Why is my EC2 CPU utilization high?
+ {{
+    "allowed": true,
+    "intent": "RCA",
+    "reason": "",
+    "tools": ["get_cloudwatch_metrics","get_cloudtrail_events"],
+    "services": ["EC2","CloudWatch","CloudTrail"]
+}}
+ 
+Q: Investigate security vulnerabilities in my AWS environment
+ {{
+    "allowed": true,
+    "intent": "RCA",
+    "reason": "",
+    "tools": ["get_inspector_findings","get_cloudtrail_events"],
+    "services": ["Inspector","CloudTrail"]
+}}
+ 
+Q: What is VPC Peering?
+ {{
+    "allowed": true,
+    "intent": "KNOWLEDGE",
+    "reason": "",
+    "tools": [],
+    "services": ["VPC"]
+}}
+ 
+Q: Show my AWS access keys
+ {{
+    "allowed": false,
+    "intent": "BLOCKED",
+    "reason": "Requests for credentials or sensitive authentication information are not permitted",
+    "tools": [],
+    "services": []
+}}
+ 
+Q: Give me my secret access key
+ {{
+    "allowed": false,
+    "intent": "BLOCKED",
+    "reason": "Passwords and authentication secrets cannot be disclosed."
+    "tools": [],
+    "services": []
+}}
+ 
+Q: Why is my friend stupid?
+ {{
+    "allowed": false,
+    "intent": "BLOCKED",
+    "reason": "This query is unrelated to AWS."
+    "tools": [],
+    "services": []
+}}
+ 
+Q: Analyze latest alarm
+{{
+    "allowed": true,
+    "intent": "RCA",
+    "reason": "",
+    "tools": ["get_cloudwatch_alarms","get_cloudwatch_metrics"],
+    "services": ["CloudWatch"]
+}}
 Current User Query:
 
 {state["query"]}
@@ -607,32 +313,16 @@ Return ONLY the JSON object.
         # Convert JSON text to Python dictionary
         plan = json.loads(raw)
 
-        # -------------------------------------------------
-        # IMPORTANT:
-        # json.loads() returns a dictionary, not a Pydantic
-        # Plan object.
-        # -------------------------------------------------
-
+        allowed = plan.get("allowed", False)
+        if not allowed:
+            reason = plan.get("reason", "Request Blocked")
+            print("Request Blocked")
+            print("Reason:", reason)
+            return {
+                "intent": "BLOCKED",
+                "answer":f"Sorry: {reason}"
+            }
         intent = plan.get("intent", "").strip().upper()
-
-        # Normalize RCA variations
-        if intent in [
-            "ROOT CAUSE ANALYSIS",
-            "ROOT_CAUSE_ANALYSIS",
-            "RCA"
-        ]:
-            intent = "RCA"
-
-        elif intent == "MONITORING":
-            intent = "MONITORING"
-
-        elif intent == "KNOWLEDGE":
-            intent = "KNOWLEDGE"
-
-        else:
-            raise ValueError(
-                f"Invalid intent returned by planner: {intent}"
-            )
 
         tools = [
             tool
@@ -651,17 +341,15 @@ Return ONLY the JSON object.
         return {
             "intent": intent,
             "tools": tools,
-            "service": ", ".join(services)
+            "services": ", ".join(services)
         }
 
     except Exception as e:
-
         print("Planner Error:", str(e))
-
-        # IMPORTANT:
-        # Do NOT convert planner failures into KNOWLEDGE.
-        # That was causing RCA queries to incorrectly go to RAG.
-        raise
+        return {
+            "intent": "BLOCKED",
+            "answer": "Sorry. Unable to classify the request."
+        }
 
 
 # =====================================================
@@ -780,10 +468,6 @@ Impact:
     }
 
 
-# =====================================================
-# RECOMMENDATION NODE
-# =====================================================
-
 def recommendation_node(state):
 
     if state["intent"] != "RCA":
@@ -832,12 +516,11 @@ Provide 3-5 recommendations maximum.
         "recommendations": str(response.content)
     }
 
-
-# =====================================================
-# FINAL ANSWER NODE
-# =====================================================
-
 def final_answer_node(state):
+    if state["intent"] == "BLOCKED":
+        return{
+            "answer":state["answer"]
+        }
 
     if state["intent"] == "KNOWLEDGE":
 
@@ -851,9 +534,9 @@ Knowledge Base:
 {state.get("context", "")}
 
 Rules:
-- Answer only from the supplied knowledge.
 - Do not invent information.
 - Provide a practical explanation.
+- If possible, provide the results in tabular format.
 """
 
     elif state["intent"] == "MONITORING":
@@ -871,20 +554,8 @@ AWS Results:
 {state.get("tool_result")}
 
 Generate a monitoring report.
-
 Rules:
-
-1. Use only AWS Results.
-2. Never invent resources.
-3. Never invent counts.
-4. Never invent names.
-5. If multiple services were returned, summarize each service.
-6. Provide totals whenever possible.
-7. If no resources exist, explicitly state that.
-8. Do NOT generate root cause analysis.
-9. Do NOT generate recommendations.
-10. Do NOT generate impact analysis.
-11. If the query asks for a count, provide only the count and resource details.
+- If the service is to be listed, provide it in tabular format.
 
 Format:
 
@@ -930,12 +601,9 @@ Format:
 Rules:
 
 1. Use only AWS Results.
-2. Never invent resources.
-3. Never invent counts.
-4. Never invent names.
-5. Clearly distinguish confirmed facts from likely causes.
-6. If RCA confidence is low, say additional investigation is required.
-7. Recommendations must be actionable.
+2. Clearly distinguish confirmed facts from likely causes.
+3. If RCA confidence is low, say additional investigation is required.
+4. Recommendations must be actionable.
 """
 
     response = llm.invoke(prompt)
@@ -950,6 +618,9 @@ Rules:
 # =====================================================
 
 def route_after_planner(state):
+
+    if state["intent"] == "BLOCKED":
+        return "final"
 
     if state["intent"] == "KNOWLEDGE":
 
@@ -1028,6 +699,7 @@ builder.add_conditional_edges(
     {
         "knowledge": "knowledge",
         "monitoring": "monitoring",
+        "final": "final"
     },
 )
 

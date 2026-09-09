@@ -12,14 +12,14 @@ load_dotenv(BASE_DIR / ".env")
 
 
 # =========================
-# Groq / LLM Configuration
+# GROQ / LLM Configuration
 # =========================
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-GROQ_MODEL = os.getenv(
-    "GROQ_MODEL",
-    "openai/gpt-oss-120b",
+OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "meta-llama/llama-4-scout",
 )
 
 

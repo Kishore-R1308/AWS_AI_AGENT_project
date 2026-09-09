@@ -429,28 +429,7 @@ def get_cloudtrail_events(session_id):
             "resources": event.get("Resources", [])
         })
  
-    return results
- 
-def get_inspector_findings(session_id):
-    inspector = get_aws_client(session_id, "inspector2")
- 
-    response = inspector.list_findings(
-        filterCriteria={
-            "severity": [
-                {
-                    "comparison": "EQUALS",
-                    "value": "CRITICAL"
-                },
-                {
-                    "comparison": "EQUALS",
-                    "value": "HIGH"
-                }
-            ]
-        }
-    )
- 
-    return response.get("findings", [])
- 
+    return results 
  
 def get_resource_tags(session_id):
  
@@ -704,5 +683,122 @@ def get_security_groups(session_id: str):
         })
 
     return results
+
+
+def get_cloudwatch_alarms(session_id):
+    cloudwatch = get_aws_client(session_id, "cloudwatch")
+ 
+    response = cloudwatch.describe_alarms()
+ 
+    return response.get("MetricAlarms", [])
+ 
+def get_cloudwatch_logs(session_id, query=None):
+    logs = get_aws_client(session_id, "logs")
+    log_groups = []
+    paginator = logs.get_paginator("describe_log_groups")
+
+    for page in paginator.paginate():
+        for group in page.get("logGroups", []):
+            name = group.get("logGroupName")
+            if name:
+                log_groups.append(name)
+
+    if not query:
+        return {
+            "log_groups": log_groups[:50],
+            "message": "No log group specified."
+        }
+
+    query_lower = query.lower()
+
+    matches = [
+        group
+        for group in log_groups
+        if group.lower() in query_lower
+        or query_lower in group.lower()
+        or any(
+            word in group.lower()
+            for word in query_lower.split()
+            if len(word) > 2
+        )
+    ]
+
+    if not matches:
+        return {
+            "error": "No matching CloudWatch log group found.",
+            "available_log_groups": log_groups[:50]
+        }
+
+    log_group = matches[0]
+
+    response = logs.filter_log_events(
+        logGroupName=log_group,
+        limit=100
+    )
+
+    return {
+        "log_group": log_group,
+        "events": response.get("events", [])
+    }
+
+
+def get_inspector_findings(session_id, query=None):
+    inspector = get_aws_client(session_id, "inspector2")
+
+    response = inspector.list_findings(
+        filterCriteria={
+            "findingStatus": [
+                {
+                    "comparison": "EQUALS",
+                    "value": "ACTIVE"
+                }
+            ]
+        },
+        maxResults=100
+    )
+
+    findings = []
+
+    for finding in response.get("findings", []):
+
+        package_vulnerabilities = []
+
+        for vuln in finding.get("packageVulnerabilityDetails", {}).get(
+            "vulnerablePackages", []
+        ):
+            package_vulnerabilities.append({
+                "name": vuln.get("name"),
+                "version": vuln.get("version"),
+                "fixed_version": vuln.get("fixedInVersion"),
+                "package_manager": vuln.get("packageManager"),
+            })
+
+        resources = []
+
+        for resource in finding.get("resources", []):
+            resources.append({
+                "type": resource.get("type"),
+                "id": resource.get("id"),
+                "partition": resource.get("partition"),
+                "region": resource.get("region"),
+            })
+
+        findings.append({
+            "finding_arn": finding.get("findingArn"),
+            "title": finding.get("title"),
+            "description": finding.get("description"),
+            "severity": finding.get("severity"),
+            "status": finding.get("status"),
+            "type": finding.get("type"),
+            "first_observed_at": finding.get("firstObservedAt"),
+            "last_observed_at": finding.get("lastObservedAt"),
+            "package_vulnerabilities": package_vulnerabilities,
+            "resources": resources,
+        })
+
+    return {
+        "total_findings": len(findings),
+        "findings": findings
+    }
 
  
