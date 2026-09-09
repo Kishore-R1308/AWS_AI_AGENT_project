@@ -20,7 +20,13 @@ class AWSConnectResponse(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    # AWS authentication/session
     session_id: str
+
+    # Individual conversation/chat
+    conversation_id: str
+
+    # Current user message
     message: str
 
 
@@ -28,6 +34,7 @@ class ChatResponse(BaseModel):
     answer: str
     intent: str
     service: Optional[str] = None
+
 
 class Plan(BaseModel):
     intent: str
