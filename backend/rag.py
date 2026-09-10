@@ -5,8 +5,11 @@ import re
 from pathlib import Path
 from typing import Iterable
 
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
+import os
+
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -17,7 +20,13 @@ from config import CHROMA_PATH
 # CONFIGURATION
 # ============================================================
 
-COLLECTION_NAME = "aws_knowledge_v2"
+COLLECTION_NAME = os.getenv(
+    "QDRANT_COLLECTION",
+    "aws_documents",
+)
+
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
 # Chunk configuration
 CHUNK_SIZE = 1200
@@ -112,7 +121,7 @@ def get_splitter():
 
 def get_vectorstore():
     """
-    Load or create the persistent ChromaDB vector store.
+    Connect to the existing Qdrant Cloud collection.
     """
 
     global _vectorstore
@@ -120,23 +129,33 @@ def get_vectorstore():
     if _vectorstore is None:
 
         print("=" * 70)
-        print("LOADING CHROMADB")
+        print("CONNECTING TO QDRANT CLOUD")
         print("=" * 70)
 
-        _vectorstore = Chroma(
+        if not QDRANT_URL:
+            raise RuntimeError(
+                "QDRANT_URL is not configured."
+            )
+
+        if not QDRANT_API_KEY:
+            raise RuntimeError(
+                "QDRANT_API_KEY is not configured."
+            )
+
+        client = QdrantClient(
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY,
+        )
+
+        _vectorstore = QdrantVectorStore(
+            client=client,
             collection_name=COLLECTION_NAME,
-            embedding_function=get_embeddings(),
-            persist_directory=CHROMA_PATH,
+            embedding=get_embeddings(),
         )
 
         print(
-            f"ChromaDB collection loaded: "
+            f"Qdrant collection connected: "
             f"{COLLECTION_NAME}"
-        )
-
-        print(
-            f"ChromaDB path: "
-            f"{CHROMA_PATH}"
         )
 
     return _vectorstore

@@ -30,3 +30,5 @@ ghostscript
 easyocr
 langchain-mistralai
 langchain-openai
+langchain-qdrant
+qdrant-client
