@@ -4,22 +4,29 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+# =========================
 # Project root directory
+# =========================
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Load .env from the project root
+
+# =========================
+# Load .env
+# =========================
+
 load_dotenv(BASE_DIR / ".env")
 
 
 # =========================
-# GROQ / LLM Configuration
+# Mistral / LLM Configuration
 # =========================
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
-OPENROUTER_MODEL = os.getenv(
-    "OPENROUTER_MODEL",
-    "meta-llama/llama-4-scout",
+MISTRAL_MODEL = os.getenv(
+    "MISTRAL_MODEL",
+    "ministral-3b-2512",
 )
 
 

@@ -355,57 +355,82 @@ def get_cloudwatch_metrics(session_id, instance_id=None):
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(hours=24)  # wider window
 
-    queries = []
+    # Standard EC2 metrics available without the CloudWatch agent
+    METRICS = [
+        ("CPUUtilization", "Average"),
+        ("NetworkIn", "Sum"),
+        ("NetworkOut", "Sum"),
+        ("NetworkPacketsIn", "Sum"),
+        ("NetworkPacketsOut", "Sum"),
+        ("DiskReadBytes", "Sum"),
+        ("DiskWriteBytes", "Sum"),
+        ("DiskReadOps", "Sum"),
+        ("DiskWriteOps", "Sum"),
+        ("StatusCheckFailed", "Maximum"),
+        ("StatusCheckFailed_Instance", "Maximum"),
+        ("StatusCheckFailed_System", "Maximum"),
+    ]
+
+    def sanitize_id(instance_id, metric_name, idx):
+        # CloudWatch Id must match ^[a-z][a-zA-Z0-9_]*$
+        clean_instance = instance_id.replace("-", "_")
+        clean_metric = metric_name.lower()
+        return f"m_{clean_instance}{clean_metric}{idx}"
 
     if instance_id:
-        queries.append({
-            "Id": "cpu",
-            "MetricStat": {
-                "Metric": {
-                    "Namespace": "AWS/EC2",
-                    "MetricName": "CPUUtilization",
-                    "Dimensions": [
-                        {"Name": "InstanceId", "Value": instance_id}
-                    ]
-                },
-                "Period": 300,
-                "Stat": "Average"
-            },
-            "ReturnData": True
-        })
+        target_instances = [{"instance_id": instance_id}]
     else:
-        # Loop through all EC2 instances instead of a dimensionless query
-        ec2_instances = get_ec2_instances(session_id)
-        for idx, inst in enumerate(ec2_instances):
+        target_instances = get_ec2_instances(session_id)
+
+    queries = []
+
+    for idx, inst in enumerate(target_instances):
+        for metric_name, stat in METRICS:
             queries.append({
-                "Id": f"cpu_{idx}",
+                "Id": sanitize_id(
+                    inst["instance_id"],
+                    metric_name,
+                    idx
+                ),
                 "MetricStat": {
                     "Metric": {
                         "Namespace": "AWS/EC2",
-                        "MetricName": "CPUUtilization",
+                        "MetricName": metric_name,
                         "Dimensions": [
-                            {"Name": "InstanceId", "Value": inst["instance_id"]}
+                            {
+                                "Name": "InstanceId",
+                                "Value": inst["instance_id"]
+                            }
                         ]
                     },
                     "Period": 300,
-                    "Stat": "Average"
+                    "Stat": stat
                 },
-                "ReturnData": True
+                "ReturnData": True,
+                "Label": f"{inst['instance_id']} - {metric_name}"
             })
 
     if not queries:
         return []
 
-    response = cloudwatch.get_metric_data(
-        MetricDataQueries=queries,
-        StartTime=start_time,
-        EndTime=end_time
-    )
+    # CloudWatch caps get_metric_data at 500 queries per call
+    all_results = []
 
-    return response.get("MetricDataResults", [])
+    for i in range(0, len(queries), 500):
+        batch = queries[i:i + 500]
 
- 
- 
+        response = cloudwatch.get_metric_data(
+            MetricDataQueries=batch,
+            StartTime=start_time,
+            EndTime=end_time
+        )
+
+        all_results.extend(
+            response.get("MetricDataResults", [])
+        )
+
+    return all_results
+
 def get_cloudtrail_events(session_id):
     cloudtrail = get_aws_client(session_id, "cloudtrail")
  
