@@ -453,6 +453,17 @@ classify the request as MONITORING unless they are explicitly
 asking why a problem occurred. If they ask why a problem
 occurred, classify the request as RCA.
 
+TAG / ACCOUNT-DATA RULES:
+- Requests for live data from the user's AWS account are MONITORING.
+- Requests to list, show, find, inspect, or count actual AWS resource tags in the user's account are MONITORING.
+- Phrases such as "in my account", "my AWS resources", "my instances", "my buckets", or "currently" indicate account-specific data when the user asks for actual resources or configuration.
+- For account-wide tag questions, select get_resource_tags.
+- For EC2 tag questions, select get_ec2_tags.
+- For S3 bucket tag questions, select get_s3_tags.
+- For Lambda tag questions, select get_lambda_tags.
+- Conceptual questions such as "What are AWS tags?" or "How do AWS tags work?" are KNOWLEDGE.
+
+
 
 ROOT CAUSE ANALYSIS:
 
@@ -553,6 +564,19 @@ Q: What are the NetworkIn and NetworkOut metrics for my EC2 instances over the l
         "CloudWatch"
     ],
     "resolved_query": "What are the NetworkIn and NetworkOut metrics for my EC2 instances over the last 24 hours?"
+}}
+
+
+
+Q: List all tags in my AWS account
+
+{{
+    "allowed": true,
+    "intent": "MONITORING",
+    "reason": "",
+    "tools": ["get_resource_tags"],
+    "services": ["AWS"],
+    "resolved_query": "List all tags in my AWS account"
 }}
 
 Q: Investigate security vulnerabilities in my AWS environment
