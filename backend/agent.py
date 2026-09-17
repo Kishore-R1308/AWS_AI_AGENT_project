@@ -431,6 +431,13 @@ MONITORING:
 
 Questions requiring live data from the user's AWS account.
 
+IMPORTANT CLASSIFICATION RULE:
+- Requests to list, show, find, inspect, count, or retrieve actual AWS resources MUST be MONITORING, not KNOWLEDGE.
+- "List all VPCs and their CIDR blocks" MUST use MONITORING with tools ["get_vpcs"].
+- "List all EC2 instances" MUST use MONITORING with tools ["get_ec2_instances"].
+- "List all S3 buckets" MUST use MONITORING with tools ["get_s3_buckets"].
+- KNOWLEDGE is only for conceptual or documentation questions.
+
 This includes:
 - Resource inventory
 - Resource counts
@@ -452,6 +459,16 @@ performance data, or CloudWatch data from their AWS account,
 classify the request as MONITORING unless they are explicitly
 asking why a problem occurred. If they ask why a problem
 occurred, classify the request as RCA.
+
+ACTION-REQUEST CLASSIFICATION RULES:
+- Requests to recommend, plan, prepare, remediate, or generate an
+  executable AWS action must be classified as RCA.
+- Live resource actions start, stop, reboot, enable, and disable
+  must be classified as RCA when requested for AWS resources.
+- EC2: start, stop, reboot. RDS: start, stop. Lambda: enable, disable.
+- A request that only lists or reports status remains MONITORING.
+- Never execute an action during planning; approval and confirmation
+  are required before execution.
 
 TAG / ACCOUNT-DATA RULES:
 - Requests for live data from the user's AWS account are MONITORING.
@@ -757,6 +774,64 @@ Return ONLY the JSON object.
         if not resolved_query:
             resolved_query = state["query"]
 
+        # Deterministic routing for common live AWS inventory requests.
+        # This prevents the LLM from incorrectly classifying account queries as KNOWLEDGE.
+        normalized_query = resolved_query.lower()
+        rca_markers = (
+            "root cause", "why did", "why is", "why are", "diagnose",
+            "diagnosis", "investigate", "troubleshoot", "what caused",
+            "high cpu", "cpu utilization is high", "performance issue",
+            "failure", "incident", "problem with", "anomaly"
+        )
+        if any(marker in normalized_query for marker in rca_markers):
+            intent = "RCA"
+            if any(term in normalized_query for term in ("ec2", "instance", "cpu", "compute")):
+                tools = ["get_ec2_instances", "get_cloudwatch_metrics", "get_cloudwatch_alarms", "get_cloudtrail_events"]
+                services = ["EC2", "CloudWatch", "CloudTrail"]
+
+        action_request_markers = (
+            "recommend starting", "recommend stopping", "recommend rebooting",
+            "recommend enabling", "recommend disabling", "executable action",
+            "remediation action", "requires confirmation", "require confirmation",
+            "after my approval", "after approval", "plan an action", "prepare an action",
+            "start ", "stop ", "reboot ", "enable ", "disable "
+        )
+        is_action_request = any(marker in normalized_query for marker in action_request_markers)
+
+        if is_action_request:
+            intent = "RCA"
+            if any(term in normalized_query for term in ("rds", "database")):
+                tools = ["get_rds_instances"]
+                services = ["RDS"]
+            elif any(term in normalized_query for term in ("lambda", "function")):
+                tools = ["get_lambda_functions", "get_lambda_tags"]
+                services = ["Lambda"]
+            elif any(term in normalized_query for term in ("ec2", "instance", "cpu", "compute")):
+                tools = ["get_ec2_instances", "get_cloudwatch_metrics", "get_cloudwatch_alarms", "get_cloudtrail_events"]
+                services = ["EC2", "CloudWatch", "CloudTrail"]
+
+        if intent == "KNOWLEDGE":
+            if "list all vpc" in normalized_query and ("cidr" in normalized_query or "vpc" in normalized_query):
+                intent = "MONITORING"
+                tools = ["get_vpcs"]
+                services = ["VPC"]
+            elif "list all ec2" in normalized_query or "list my ec2" in normalized_query:
+                intent = "MONITORING"
+                tools = ["get_ec2_instances"]
+                services = ["EC2"]
+            elif "list all s3 bucket" in normalized_query or "list my s3 bucket" in normalized_query:
+                intent = "MONITORING"
+                tools = ["get_s3_buckets"]
+                services = ["S3"]
+            elif "list all rds" in normalized_query or "list my rds" in normalized_query:
+                intent = "MONITORING"
+                tools = ["get_rds_instances"]
+                services = ["RDS"]
+            elif "list all lambda" in normalized_query or "list my lambda" in normalized_query:
+                intent = "MONITORING"
+                tools = ["get_lambda_functions"]
+                services = ["Lambda"]
+
         print("\n===== PLANNER OUTPUT =====")
         print("Intent:", intent)
         print("Tools:", tools)
@@ -913,9 +988,12 @@ Your job:
 2. Correlate evidence across AWS services.
 3. Determine the most likely root cause.
 4. Do not invent missing information.
-5. Clearly distinguish facts from assumptions.
-6. If there is insufficient evidence, say so.
-7. Assign confidence:
+5. Clearly distinguish confirmed observations, supported inferences, and unknowns.
+6. If metrics are empty or an instance is stopped, do NOT claim a cause, intentional stopping, agent involvement, monitoring absence, or user action.
+7. Never call a cause High or Medium confidence unless the supplied evidence directly supports it.
+8. If evidence is insufficient, explicitly write: "No root cause confirmed from the available evidence."
+9. Do not infer that the AI agent, CloudWatch Agent, or any person stopped or changed an instance without explicit CloudTrail evidence.
+10. Assign confidence:
    - High
    - Medium
    - Low
@@ -954,84 +1032,170 @@ Impact:
 # =====================================================
 
 def recommendation_node(state):
+    """Generate safe, structured RCA recommendations."""
 
-    if state["intent"] != "RCA":
-
-        return {
-            "recommendations": "Recommendations not required"
-        }
+    if state.get("intent") != "RCA":
+        return {"recommendations": "Recommendations not required"}
 
     history_text = format_last_turn(state.get("history", []))
-
-    resolved_query = state.get(
-        "resolved_query",
-        state["query"]
-    )
+    resolved_query = state.get("resolved_query", state["query"])
 
     prompt = f"""
-You are an AWS remediation and recommendation engine.
+You are an AWS RCA remediation planner.
 
-=====================================================
-CONVERSATION HISTORY
-=====================================================
+Use only the current query, previous turn, AWS evidence, and RCA.
+Do not invent resource IDs, names, or parameter values.
+Do not execute anything.
+Only create executable actions when every required parameter is explicitly available.
+The backend will validate actions and execute an approved batch sequentially.
+The user gives one confirmation for the complete batch, not one confirmation per action.
 
+Previous turn:
 {history_text}
 
-=====================================================
-CURRENT USER QUERY
-=====================================================
-
+Current query:
 {state["query"]}
 
-=====================================================
-RESOLVED QUERY
-=====================================================
-
+Resolved query:
 {resolved_query}
 
-=====================================================
-AWS EVIDENCE
-=====================================================
-
+AWS evidence:
 {state.get("tool_result", "")}
 
-=====================================================
-ROOT CAUSE ANALYSIS
-=====================================================
-
+Root cause analysis:
 {state.get("rca", "")}
 
-Generate practical recommendations.
+Supported executable operations:
+- action: create, delete, start, stop, or reboot
+- EC2 start/stop/reboot use resource_type ec2_instance; RDS start/stop use rds_instance; Lambda enable/disable use lambda_function
+- create/delete resource types: s3_bucket, ec2_instance, rds_instance, lambda_function,
+  security_group, vpc, subnet, iam_resource
+
+Return ONLY valid JSON in this format:
+{{
+  "issue_title": "Short issue title",
+  "issue_description": "Confirmed issue description",
+  "recommendations": [
+    {{
+      "priority": "high|medium|low",
+      "action": "Recommended action",
+      "reason": "Why it is recommended",
+      "expected_result": "Expected result",
+      "requires_approval": true
+    }}
+  ],
+  "actions": [
+    {{
+      "action_id": "unique-id",
+      "action": "create|delete|start|stop|reboot",
+      "resource_type": "supported resource type",
+      "parameters": {{}},
+      "explanation": "Why this action is required",
+      "status": "pending"
+    }}
+  ]
+}}
 
 Rules:
-
-1. Recommendations must be based on the evidence.
-2. Do not invent AWS resources.
-3. Do not recommend destructive actions automatically.
-4. Prioritize recommendations.
-5. Explain why each recommendation is useful.
-6. Separate investigation from remediation.
-7. If remediation could modify infrastructure, mark it as requiring user approval.
-
-Return:
-
-Priority:
-Action:
-Reason:
-Expected Result:
-
-Provide 3-5 recommendations maximum.
+- Never recommend associate-vpc-cidr-block-association as a way to enable CloudWatch or CPU monitoring.
+- EC2 CPUUtilization is AWS-provided; CloudWatch Agent is for OS-level metrics such as memory, processes, and disk space.
+- If an instance is stopped, state that current metrics may be unavailable and do not recommend installing software until it is running.
+- A terminated instance cannot be remediated as a running instance.
+- Never claim the AI agent caused a termination without explicit CloudTrail evidence.
+- Create executable actions only when supported and all required parameters are present.
+- Supported executable actions include EC2 start/stop/reboot, RDS start/stop, Lambda enable/disable, and the supported create/delete operations. Never invent install-agent or monitoring actions.
+- For EC2 start/stop/reboot, use live instance state: start only stopped instances, stop/reboot only running instances. Never create an action when the current state makes it invalid.
+- If the current request is only a monitoring/status question, return empty recommendations and empty actions.
+- Maximum 5 recommendations.
+- Use an empty actions list when required parameters are missing.
+- Never include speculative or destructive actions.
+- Do not include Markdown or text outside the JSON object.
 """
 
-    response = llm.invoke(
-        prompt
-    )
+    try:
+        response = llm.invoke(prompt)
+        raw = str(response.content).strip()
 
-    return {
-        "recommendations": str(
-            response.content
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "").replace("```", "").strip()
+
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("Invalid recommendation structure")
+
+        recommendations = parsed.get("recommendations", [])
+        actions = parsed.get("actions", [])
+
+        if not isinstance(recommendations, list):
+            recommendations = []
+        if not isinstance(actions, list):
+            actions = []
+
+        return {
+            "recommendations": json.dumps(
+                {
+                    "issue_title": str(parsed.get("issue_title", "RCA Issue")),
+                    "issue_description": str(parsed.get("issue_description", "")),
+                    "recommendations": recommendations[:5],
+                    "actions": actions,
+                },
+                ensure_ascii=False,
+            )
+        }
+
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        print(f"Recommendation parsing error: {exc}")
+        return {
+            "recommendations": json.dumps(
+                {
+                    "issue_title": "RCA Recommendations",
+                    "issue_description": "Structured remediation actions could not be generated safely.",
+                    "recommendations": [],
+                    "actions": [],
+                },
+                ensure_ascii=False,
+            )
+        }
+
+
+# =====================================================
+# OUTPUT SAFETY HELPERS
+# =====================================================
+
+def _remove_duplicate_recommendations(text: str) -> str:
+    """Keep structured recommendations in the UI, not duplicated in the LLM answer."""
+    if not text:
+        return text
+    import re
+    cleaned = re.split(r"(?im)^\s*#+\s*recommendations\s*$", text, maxsplit=1)[0]
+    return cleaned.rstrip()
+
+
+def _apply_evidence_guardrails(text: str, state) -> str:
+    """Prevent unsupported RCA certainty when AWS evidence is incomplete."""
+    if state.get("intent") != "RCA":
+        return text
+    evidence = str(state.get("tool_result", "")).lower()
+    if ("stopped" in evidence and ("metric" in evidence or "cloudwatch" in evidence)
+            and ("empty" in evidence or "no data" in evidence or "null" in evidence)):
+        unsafe = (
+            "intentionally stopped", "ai agent", "cloudwatch agent is not installed",
+            "cloudwatch agent was absent", "the user stopped", "routine checks", "no monitoring", "monitoring is not enabled"
         )
-    }
+        if any(term in text.lower() for term in unsafe):
+            return (
+                "## Root Cause Analysis\n\n"
+                "**Confirmed observations:** The supplied AWS data indicates that one or more "
+                "instances are stopped and the available monitoring data is empty or insufficient.\n\n"
+                "**Conclusion:** No root cause confirmed from the available evidence. Current CPU and "
+                "other runtime metrics cannot be evaluated for a stopped instance. The evidence does not "
+                "establish who or what stopped the instance, whether the stop was intentional, or whether "
+                "an AI agent or monitoring agent caused a change.\n\n"
+                "**Confidence:** Low / insufficient evidence\n\n"
+                "**Impact:** Runtime performance cannot be assessed until the instance is running and "
+                "relevant historical evidence is available."
+            )
+    return text
 
 
 # =====================================================
@@ -1199,12 +1363,6 @@ ROOT CAUSE ANALYSIS
 
 {state.get("rca", "")}
 
-=====================================================
-RECOMMENDATIONS
-=====================================================
-
-{state.get("recommendations", "")}
-
 Generate a professional response.
 
 Answer only the resolved question. Do not introduce unrelated information from previous turns.
@@ -1226,16 +1384,24 @@ Rules:
 1. Use only AWS Results for account-specific findings.
 2. Clearly distinguish confirmed facts from likely causes.
 3. If RCA confidence is low, say additional investigation is required.
-4. Recommendations must be actionable.
+4. Do not generate a separate Recommendations section; structured recommendations are rendered separately by the frontend.
 5. Do not invent AWS resources or evidence.
+6. State that no action is executed automatically; ask the user to review and explicitly confirm any proposed batch.
+7. Do not claim execution success or failure unless execution results are present.
 """
 
     response = llm.invoke(
         prompt
     )
 
+    answer_text = str(response.content).replace(
+        "associate-vpc-cidr-block-association",
+        "Do not use VPC CIDR association commands to enable CloudWatch monitoring"
+    )
+    answer_text = _remove_duplicate_recommendations(answer_text)
+    answer_text = _apply_evidence_guardrails(answer_text, state)
     return {
-        "answer": response.content
+        "answer": answer_text
     }
 
 

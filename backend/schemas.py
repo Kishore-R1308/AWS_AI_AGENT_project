@@ -1,7 +1,11 @@
-from typing import List, Optional
+﻿from typing import List, Optional
 
 from pydantic import BaseModel
 
+
+# =====================================================
+# AWS CONNECTION
+# =====================================================
 
 class AWSConnectRequest(BaseModel):
     access_key: str
@@ -19,14 +23,13 @@ class AWSConnectResponse(BaseModel):
     session_id: str
 
 
+# =====================================================
+# CHAT
+# =====================================================
+
 class ChatRequest(BaseModel):
-    # AWS authentication/session
     session_id: str
-
-    # Individual conversation/chat
     conversation_id: str
-
-    # Current user message
     message: str
 
 
@@ -35,6 +38,14 @@ class ChatResponse(BaseModel):
     intent: str
     service: Optional[str] = None
 
+    # RCA fields
+    rca: Optional[str] = None
+    recommendations: Optional[str] = None
+
+
+# =====================================================
+# PLAN
+# =====================================================
 
 class Plan(BaseModel):
     intent: str
