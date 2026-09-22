@@ -23,6 +23,77 @@ st.set_page_config(
 
 
 # =====================================================
+# RESOURCE MANAGER STYLING
+# =====================================================
+
+st.markdown(
+    """
+    <style>
+    .resource-card {
+        padding: 0.2rem 0;
+    }
+
+    .resource-id {
+        color: #8b949e;
+        font-size: 0.85rem;
+        font-family: monospace;
+        margin-top: -0.45rem;
+    }
+
+    .status-running {
+        display: inline-block;
+        padding: 0.28rem 0.7rem;
+        border-radius: 999px;
+        background: #163b28;
+        color: #6ee7a2;
+        font-weight: 600;
+        font-size: 0.82rem;
+    }
+
+    .status-stopped {
+        display: inline-block;
+        padding: 0.28rem 0.7rem;
+        border-radius: 999px;
+        background: #4a1d22;
+        color: #ff9aa5;
+        font-weight: 600;
+        font-size: 0.82rem;
+    }
+
+    .status-other {
+        display: inline-block;
+        padding: 0.28rem 0.7rem;
+        border-radius: 999px;
+        background: #4a3a16;
+        color: #f8d477;
+        font-weight: 600;
+        font-size: 0.82rem;
+    }
+
+    .detail-label {
+        color: #9ca3af;
+        font-size: 0.82rem;
+        margin-bottom: 0.1rem;
+    }
+
+    .detail-value {
+        font-size: 0.98rem;
+        font-weight: 500;
+        word-break: break-word;
+    }
+
+    .section-heading {
+        font-size: 1.05rem;
+        font-weight: 700;
+        margin: 0.4rem 0 0.7rem 0;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# =====================================================
 # SESSION STATE
 # =====================================================
 
@@ -37,6 +108,10 @@ DEFAULT_STATE = {
     "pending_batch_payload": None,
     "pending_action_id": None,
     "pending_action_payload": None,
+    "live_resources": [],
+    "live_resources_service": None,
+    "live_resources_refresh_needed": False,
+    "live_resources_refresh_service": None,
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -99,6 +174,24 @@ def reset_pending_batch():
 def reset_pending_action():
     st.session_state.pending_action_id = None
     st.session_state.pending_action_payload = None
+
+
+def mark_live_resources_for_refresh(resource_type):
+    """Mark the affected service to refresh after a successful AWS action."""
+    service_map = {
+        "s3_bucket": "s3",
+        "ec2_instance": "ec2",
+        "rds_instance": "rds",
+        "lambda_function": "lambda",
+        "security_group": "security_group",
+        "vpc": "vpc",
+        "subnet": "subnet",
+    }
+
+    service = service_map.get(resource_type)
+
+    st.session_state.live_resources_refresh_needed = bool(service)
+    st.session_state.live_resources_refresh_service = service
 
 
 # =====================================================
@@ -738,8 +831,40 @@ def display_single_action_manager():
         st.subheader("🔐 Confirm AWS Action")
         st.write("Review the planned action before execution.")
 
-        if st.session_state.pending_action_payload:
-            st.json(st.session_state.pending_action_payload)
+        payload = st.session_state.pending_action_payload or {}
+
+        # Show the planned action as a human-readable confirmation card
+        # instead of exposing the internal JSON payload.
+        action = str(payload.get("action", "unknown")).upper()
+        resource_type = str(payload.get("resource_type", "unknown"))
+        parameters = payload.get("parameters") or {}
+        explanation = payload.get("explanation")
+
+        info_col, resource_col = st.columns(2)
+
+        with info_col:
+            st.markdown("**Action**")
+            st.info(action)
+
+        with resource_col:
+            st.markdown("**Resource**")
+            st.info(resource_type.replace("_", " ").title())
+
+        st.markdown("**Target**")
+        if parameters:
+            for key, value in parameters.items():
+                label = key.replace("_", " ").title()
+                st.write(f"**{label}:** {value}")
+        else:
+            st.write("No additional parameters")
+
+        if explanation:
+            st.caption(f"Reason: {explanation}")
+
+        st.warning(
+            "This action can modify your live AWS environment. "
+            "Only confirm if you want AWS to perform this operation."
+        )
 
         confirmation = st.text_input(
             f"Type exactly: {CONFIRMATION_PHRASE}",
@@ -785,7 +910,13 @@ def display_single_action_manager():
                     if response.status_code == 200:
                         st.success("AWS action execution completed.")
                         st.json(response.json())
+
+                        # Keep the confirmation workflow only on the
+                        # Create / Delete page, but refresh the affected
+                        # service when the user opens Live Resources.
+                        mark_live_resources_for_refresh(resource_type)
                         reset_pending_action()
+                        st.rerun()
                     else:
                         show_error(response, "AWS action execution failed.")
 
@@ -797,10 +928,526 @@ def display_single_action_manager():
 # LIVE AWS RESOURCE MANAGEMENT
 # =====================================================
 
-def display_resource_manager():
-    """Display live AWS resources."""
+def get_service_icon(service):
+    """Return a readable icon for an AWS service."""
+    return {
+        "ec2": "🖥️",
+        "s3": "🪣",
+        "rds": "🗄️",
+        "lambda": "λ",
+        "vpc": "🌐",
+        "subnet": "🔗",
+        "security_group": "🔐",
+    }.get(service, "☁️")
 
+
+def get_service_title(service):
+    """Return a human-readable service title."""
+    return {
+        "ec2": "EC2 Instances",
+        "s3": "S3 Buckets",
+        "rds": "RDS Databases",
+        "lambda": "Lambda Functions",
+        "vpc": "VPCs",
+        "subnet": "Subnets",
+        "security_group": "Security Groups",
+    }.get(service, service.upper())
+
+
+def format_label(key):
+    """Convert API-style keys into readable labels."""
+    replacements = {
+        "id": "ID",
+        "arn": "ARN",
+        "ip": "IP",
+        "vpc": "VPC",
+        "cidr": "CIDR",
+        "rds": "RDS",
+        "s3": "S3",
+        "ec2": "EC2",
+        "db": "DB",
+        "iam": "IAM",
+    }
+
+    words = str(key).replace("_", " ").split()
+    result = []
+
+    for word in words:
+        lower = word.lower()
+        result.append(replacements.get(lower, word.capitalize()))
+
+    return " ".join(result)
+
+
+def format_value(value):
+    """Convert common API values into readable text."""
+    if value is None or value == "":
+        return "Not available"
+
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+
+    if isinstance(value, (dict, list)):
+        return None
+
+    return str(value)
+
+
+def get_status_class(status):
+    """Return the CSS class for a resource status."""
+    status = str(status or "unknown").lower()
+
+    if status in {"running", "available", "active", "enabled", "in-use"}:
+        return "status-running"
+
+    if status in {"stopped", "failed", "inactive", "disabled", "deleting"}:
+        return "status-stopped"
+
+    return "status-other"
+
+
+def display_detail_grid(items, columns=3):
+    """Display flat technical details as a human-readable grid."""
+    valid_items = []
+
+    for key, value in items:
+        if value is None or value == "":
+            display_value = "Not available"
+        else:
+            display_value = format_value(value)
+
+        if display_value is None:
+            continue
+
+        valid_items.append((format_label(key), display_value))
+
+    if not valid_items:
+        st.caption("No additional technical information is available.")
+        return
+
+    for start in range(0, len(valid_items), columns):
+        row = valid_items[start:start + columns]
+        cols = st.columns(columns)
+
+        for index, (label, value) in enumerate(row):
+            with cols[index]:
+                st.markdown(
+                    f'<div class="detail-label">{label}</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f'<div class="detail-value">{value}</div>',
+                    unsafe_allow_html=True,
+                )
+
+
+def display_nested_list(title, items, key_prefix):
+    """Display a list of dictionaries without exposing JSON."""
+    if not items:
+        st.caption(f"{title}: None")
+        return
+
+    st.markdown(f"#### {title}")
+
+    if all(isinstance(item, dict) for item in items):
+        for index, item in enumerate(items, start=1):
+            with st.container(border=True):
+                st.markdown(f"**{title.rstrip('s')} {index}**")
+                flat_items = []
+                nested_items = []
+
+                for key, value in item.items():
+                    if isinstance(value, (dict, list)):
+                        nested_items.append((key, value))
+                    else:
+                        flat_items.append((key, value))
+
+                display_detail_grid(flat_items, columns=3)
+
+                for nested_key, nested_value in nested_items:
+                    label = format_label(nested_key)
+                    if isinstance(nested_value, list):
+                        if nested_value:
+                            st.markdown(f"**{label}**")
+                            if all(isinstance(x, dict) for x in nested_value):
+                                for nested_index, nested_item in enumerate(nested_value, start=1):
+                                    st.markdown(f"*{label} {nested_index}*")
+                                    display_detail_grid(list(nested_item.items()), columns=3)
+                            else:
+                                st.write(", ".join(str(x) for x in nested_value))
+                    else:
+                        st.markdown(f"**{label}:**")
+                        display_detail_grid(list(nested_value.items()), columns=3)
+    else:
+        for index, item in enumerate(items, start=1):
+            st.write(f"{index}. {item}")
+
+
+def display_ec2_details(details):
+    st.markdown("#### 🖥️ Instance Information")
+    display_detail_grid([
+        ("instance_id", details.get("instance_id")),
+        ("name", details.get("name")),
+        ("state", details.get("state")),
+        ("instance_type", details.get("instance_type")),
+    ])
+
+    st.divider()
+    st.markdown("#### 🌐 Network Information")
+    display_detail_grid([
+        ("private_ip", details.get("private_ip")),
+        ("public_ip", details.get("public_ip")),
+        ("availability_zone", details.get("availability_zone")),
+        ("vpc_id", details.get("vpc_id")),
+        ("subnet_id", details.get("subnet_id")),
+    ])
+
+    extra = {
+        key: value
+        for key, value in details.items()
+        if key not in {
+            "instance_id", "name", "state", "instance_type",
+            "private_ip", "public_ip", "availability_zone",
+            "vpc_id", "subnet_id",
+        }
+    }
+
+    if extra:
+        st.divider()
+        st.markdown("#### ⚙️ Additional Information")
+        display_detail_grid(list(extra.items()), columns=3)
+
+
+def display_s3_details(details):
+    st.markdown("#### 🪣 Bucket Information")
+    display_detail_grid([
+        ("name", details.get("name")),
+        ("created", details.get("created")),
+        ("region", details.get("region")),
+        ("bucket_arn", details.get("bucket_arn")),
+    ])
+
+    extra = {
+        key: value
+        for key, value in details.items()
+        if key not in {"name", "created", "region", "bucket_arn"}
+    }
+
+    if extra:
+        st.divider()
+        st.markdown("#### ⚙️ Additional Information")
+        display_detail_grid(list(extra.items()), columns=3)
+
+
+def display_rds_details(details):
+    st.markdown("#### 🗄️ Database Information")
+    display_detail_grid([
+        ("identifier", details.get("identifier")),
+        ("status", details.get("status")),
+        ("engine", details.get("engine")),
+        ("engine_version", details.get("engine_version")),
+        ("instance_class", details.get("instance_class")),
+        ("storage_gb", details.get("storage_gb")),
+        ("endpoint", details.get("endpoint")),
+        ("port", details.get("port")),
+        ("availability_zone", details.get("availability_zone")),
+    ])
+
+    extra = {
+        key: value
+        for key, value in details.items()
+        if key not in {
+            "identifier", "status", "engine", "engine_version",
+            "instance_class", "storage_gb", "endpoint", "port",
+            "availability_zone",
+        }
+    }
+
+    if extra:
+        st.divider()
+        st.markdown("#### ⚙️ Additional Information")
+        display_detail_grid(
+            [(key, value) for key, value in extra.items()
+             if not isinstance(value, (dict, list))],
+            columns=3,
+        )
+
+        for key, value in extra.items():
+            if isinstance(value, list):
+                display_nested_list(format_label(key), value, key)
+            elif isinstance(value, dict):
+                with st.expander(format_label(key), expanded=False):
+                    display_detail_grid(list(value.items()), columns=3)
+
+
+def display_lambda_details(details):
+    st.markdown("#### λ Function Information")
+    display_detail_grid([
+        ("function_name", details.get("function_name")),
+        ("runtime", details.get("runtime")),
+        ("last_modified", details.get("last_modified")),
+        ("arn", details.get("arn")),
+        ("handler", details.get("handler")),
+        ("memory_size", details.get("memory_size")),
+        ("timeout", details.get("timeout")),
+    ])
+
+    extra = {
+        key: value
+        for key, value in details.items()
+        if key not in {
+            "function_name", "runtime", "last_modified", "arn",
+            "handler", "memory_size", "timeout",
+        }
+    }
+
+    if extra:
+        st.divider()
+        st.markdown("#### ⚙️ Additional Information")
+        display_detail_grid(
+            [(key, value) for key, value in extra.items()
+             if not isinstance(value, (dict, list))],
+            columns=3,
+        )
+        for key, value in extra.items():
+            if isinstance(value, list):
+                display_nested_list(format_label(key), value, key)
+            elif isinstance(value, dict):
+                with st.expander(format_label(key), expanded=False):
+                    display_detail_grid(list(value.items()), columns=3)
+
+
+def display_vpc_details(details):
+    st.markdown("#### 🌐 VPC Information")
+    display_detail_grid([
+        ("vpc_id", details.get("vpc_id")),
+        ("name", details.get("name")),
+        ("cidr_block", details.get("cidr_block")),
+        ("state", details.get("state")),
+        ("is_default", details.get("is_default")),
+    ])
+
+
+def display_subnet_details(details):
+    st.markdown("#### 🔗 Subnet Information")
+    display_detail_grid([
+        ("subnet_id", details.get("subnet_id")),
+        ("name", details.get("name")),
+        ("vpc_id", details.get("vpc_id")),
+        ("cidr_block", details.get("cidr_block")),
+        ("availability_zone", details.get("availability_zone")),
+    ])
+
+
+def display_security_group_details(details):
+    st.markdown("#### 🔐 Security Group Information")
+    display_detail_grid([
+        ("group_id", details.get("group_id")),
+        ("name", details.get("name")),
+        ("description", details.get("description")),
+        ("vpc_id", details.get("vpc_id")),
+    ])
+
+    st.divider()
+    display_nested_list(
+        "Inbound Rules",
+        details.get("inbound_rules") or [],
+        "inbound",
+    )
+
+    st.divider()
+    display_nested_list(
+        "Outbound Rules",
+        details.get("outbound_rules") or [],
+        "outbound",
+    )
+
+
+def display_generic_details(details):
+    """Fallback renderer for any future resource type."""
+    flat = []
+    nested = []
+
+    for key, value in details.items():
+        if isinstance(value, (dict, list)):
+            nested.append((key, value))
+        else:
+            flat.append((key, value))
+
+    display_detail_grid(flat, columns=3)
+
+    for key, value in nested:
+        label = format_label(key)
+        st.divider()
+        if isinstance(value, list):
+            display_nested_list(label, value, key)
+        else:
+            st.markdown(f"#### {label}")
+            display_detail_grid(list(value.items()), columns=3)
+
+
+def display_resource_technical_details(service, details):
+    """Render technical details in human-readable form for every resource."""
+    if service == "ec2":
+        display_ec2_details(details)
+    elif service == "s3":
+        display_s3_details(details)
+    elif service == "rds":
+        display_rds_details(details)
+    elif service == "lambda":
+        display_lambda_details(details)
+    elif service == "vpc":
+        display_vpc_details(details)
+    elif service == "subnet":
+        display_subnet_details(details)
+    elif service == "security_group":
+        display_security_group_details(details)
+    else:
+        display_generic_details(details)
+
+
+def resource_summary_fields(service, details):
+    """Return the small set of fields shown directly on each card."""
+    if service == "ec2":
+        return [
+            ("Instance Type", details.get("instance_type")),
+            ("Private IP", details.get("private_ip")),
+            ("Public IP", details.get("public_ip")),
+            ("State", details.get("state")),
+        ]
+
+    if service == "s3":
+        return [
+            ("Created", details.get("created")),
+            ("Region", details.get("region")),
+        ]
+
+    if service == "rds":
+        return [
+            ("Status", details.get("status")),
+            ("Engine", details.get("engine")),
+            ("Engine Version", details.get("engine_version")),
+            ("Instance Class", details.get("instance_class")),
+        ]
+
+    if service == "lambda":
+        return [
+            ("Runtime", details.get("runtime")),
+            ("Last Modified", details.get("last_modified")),
+        ]
+
+    if service == "vpc":
+        return [
+            ("CIDR Block", details.get("cidr_block")),
+            ("State", details.get("state")),
+            ("Default VPC", details.get("is_default")),
+        ]
+
+    if service == "subnet":
+        return [
+            ("VPC ID", details.get("vpc_id")),
+            ("CIDR Block", details.get("cidr_block")),
+            ("Availability Zone", details.get("availability_zone")),
+        ]
+
+    if service == "security_group":
+        inbound = details.get("inbound_rules") or []
+        outbound = details.get("outbound_rules") or []
+        return [
+            ("VPC ID", details.get("vpc_id")),
+            ("Inbound Rules", len(inbound)),
+            ("Outbound Rules", len(outbound)),
+        ]
+
+    return []
+
+
+def get_live_resource_actions(service):
+    """Return actions supported by the current backend for an existing resource."""
+    return {
+        "ec2": ["start", "stop", "reboot", "delete"],
+        "s3": ["delete"],
+        "rds": ["start", "stop", "delete"],
+        "lambda": ["enable", "disable", "delete"],
+        "vpc": ["delete"],
+        "subnet": ["delete"],
+        "security_group": ["delete"],
+    }.get(service, [])
+
+
+def build_live_resource_action(service, details, resource_id, resource_name, action):
+    """Build parameters matching backend/action_validation.py and aws_action_executor.py."""
+    if service == "ec2":
+        parameters = {
+            "instance_id": details.get("instance_id") or resource_id,
+        }
+        resource_type = "ec2_instance"
+
+    elif service == "s3":
+        parameters = {
+            "bucket_name": details.get("name") or resource_id,
+        }
+        resource_type = "s3_bucket"
+
+    elif service == "rds":
+        parameters = {
+            "db_instance_identifier": details.get("identifier") or resource_id,
+        }
+        resource_type = "rds_instance"
+        if action == "delete":
+            parameters["skip_final_snapshot"] = False
+
+    elif service == "lambda":
+        parameters = {
+            "function_name": details.get("function_name") or resource_id,
+        }
+        resource_type = "lambda_function"
+
+    elif service == "vpc":
+        parameters = {
+            "vpc_id": details.get("vpc_id") or resource_id,
+        }
+        resource_type = "vpc"
+
+    elif service == "subnet":
+        parameters = {
+            "subnet_id": details.get("subnet_id") or resource_id,
+        }
+        resource_type = "subnet"
+
+    elif service == "security_group":
+        parameters = {
+            "group_id": details.get("group_id") or resource_id,
+        }
+        resource_type = "security_group"
+
+    else:
+        raise ValueError(f"No live-resource action mapping for {service}")
+
+    # Backend requires the resource identifier to be repeated as the
+    # delete_confirmation value for delete plans.
+    if action == "delete":
+        identifier = (
+            parameters.get("bucket_name")
+            or parameters.get("instance_id")
+            or parameters.get("db_instance_identifier")
+            or parameters.get("function_name")
+            or parameters.get("group_id")
+            or parameters.get("vpc_id")
+            or parameters.get("subnet_id")
+        )
+        parameters["delete_confirmation"] = identifier
+
+    return resource_type, parameters
+
+
+def display_resource_manager():
+    """Display live AWS resources as human-readable resource cards."""
     st.header("☁️ Live AWS Resources")
+    st.caption(
+        "View live AWS resources in a readable format. "
+        "Technical information is displayed as fields and sections, not raw JSON."
+    )
 
     service = st.selectbox(
         "AWS service",
@@ -813,22 +1460,68 @@ def display_resource_manager():
             "subnet",
             "security_group",
         ],
+        format_func=lambda value: (
+            f"{get_service_icon(value)} {get_service_title(value)}"
+        ),
         key="live_resource_service",
     )
+
+    # A successful Create/Delete action does not display its confirmation
+    # here. Instead, when the user opens Live Resources, refresh only the
+    # affected service so the newly created/deleted resource is reflected.
+    refresh_needed = st.session_state.get(
+        "live_resources_refresh_needed", False
+    )
+    refresh_service = st.session_state.get(
+        "live_resources_refresh_service"
+    )
+
+    if refresh_needed and refresh_service == service:
+        try:
+            with st.spinner(
+                f"Refreshing {get_service_title(service)}..."
+            ):
+                response = requests.get(
+                    f"{BACKEND_URL}/aws/resources/"
+                    f"{st.session_state.session_id}",
+                    params={"service": service},
+                    timeout=60,
+                )
+
+            if response.status_code == 200:
+                data = response.json()
+                resources = (
+                    data.get("resources", [])
+                    if isinstance(data, dict)
+                    else []
+                )
+                st.session_state.live_resources = resources
+                st.session_state.live_resources_service = service
+                st.session_state.live_resources_refresh_needed = False
+                st.session_state.live_resources_refresh_service = None
+            else:
+                show_error(
+                    response,
+                    "Could not refresh AWS resources after the action.",
+                )
+        except requests.exceptions.RequestException as exc:
+            st.error(f"Resource refresh failed: {exc}")
 
     if st.button(
         "🔄 Load Live Resources",
         use_container_width=True,
+        type="primary",
     ):
         try:
-            response = requests.get(
-                f"{BACKEND_URL}/aws/resources/"
-                f"{st.session_state.session_id}",
-                params={
-                    "service": service,
-                },
-                timeout=60,
-            )
+            with st.spinner(
+                f"Loading {get_service_title(service)}..."
+            ):
+                response = requests.get(
+                    f"{BACKEND_URL}/aws/resources/"
+                    f"{st.session_state.session_id}",
+                    params={"service": service},
+                    timeout=60,
+                )
 
             if response.status_code != 200:
                 show_error(
@@ -837,29 +1530,127 @@ def display_resource_manager():
                 )
                 return
 
-            resources = response.json()
+            data = response.json()
+            resources = data.get("resources", []) if isinstance(data, dict) else []
+
+            st.session_state.live_resources = resources
+            st.session_state.live_resources_service = service
 
             st.success(
-                f"Loaded {service.upper()} resources."
+                f"Loaded {len(resources)} {get_service_title(service).lower()}."
             )
-
-            if isinstance(resources, list):
-                if resources:
-                    st.dataframe(
-                        resources,
-                        use_container_width=True,
-                    )
-                else:
-                    st.info(
-                        "No resources found."
-                    )
-            else:
-                st.json(resources)
 
         except requests.exceptions.RequestException as exc:
-            st.error(
-                f"Resource loading failed: {exc}"
-            )
+            st.error(f"Resource loading failed: {exc}")
+            return
+
+    resources = st.session_state.get("live_resources", [])
+    loaded_service = st.session_state.get("live_resources_service")
+
+    if loaded_service != service:
+        resources = []
+
+    if not resources:
+        st.info(
+            "Select an AWS service and click 'Load Live Resources' "
+            "to view the resources."
+        )
+        return
+
+    st.divider()
+
+    title_col, count_col = st.columns([5, 1])
+    with title_col:
+        st.markdown(
+            f"## {get_service_icon(service)} {get_service_title(service)}"
+        )
+    with count_col:
+        st.metric("Resources", len(resources))
+
+    for index, resource in enumerate(resources):
+        details = resource.get("details") or {}
+        resource_id = resource.get("id") or "Unknown"
+        resource_name = resource.get("name") or resource_id
+
+        if not isinstance(details, dict):
+            details = {"details": details}
+
+        if service == "ec2":
+            title = f"🖥️ {resource_name}"
+            status = details.get("state", "unknown")
+        elif service == "s3":
+            title = f"🪣 {resource_name}"
+            status = None
+        elif service == "rds":
+            title = f"🗄️ {resource_name}"
+            status = details.get("status", "unknown")
+        elif service == "lambda":
+            title = f"λ {resource_name}"
+            status = None
+        elif service == "vpc":
+            title = f"🌐 {resource_name}"
+            status = details.get("state", "available")
+        elif service == "subnet":
+            title = f"🔗 {resource_name}"
+            status = None
+        else:
+            title = f"🔐 {resource_name}"
+            status = None
+
+        with st.container(border=True):
+            header_col, status_col = st.columns([5, 1])
+
+            with header_col:
+                st.markdown(f"### {title}")
+                st.markdown(
+                    f'<div class="resource-id">{resource_id}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            if status is not None:
+                with status_col:
+                    status_class = get_status_class(status)
+                    st.markdown(
+                        f'<div class="{status_class}">{str(status).title()}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            st.divider()
+
+            summary = resource_summary_fields(service, details)
+            if summary:
+                display_detail_grid(summary, columns=4)
+            else:
+                st.caption("Resource information available in Technical Details.")
+
+            st.divider()
+
+            details_key = f"show_resource_details_{service}_{index}_{resource_id}"
+
+            if st.button(
+                "🔍 View Technical Details"
+                if not st.session_state.get(details_key, False)
+                else "🔼 Hide Technical Details",
+                key=f"resource_details_button_{service}_{index}_{resource_id}",
+                use_container_width=True,
+            ):
+                st.session_state[details_key] = not st.session_state.get(
+                    details_key,
+                    False,
+                )
+                st.rerun()
+
+            if st.session_state.get(details_key, False):
+                st.divider()
+                with st.container(border=True):
+                    display_resource_technical_details(
+                        service,
+                        details,
+                    )
+
+            # RCA is deliberately not shown here.
+            # RCA remains available through the main AI Agent chat.
+
 
 
 # =====================================================
